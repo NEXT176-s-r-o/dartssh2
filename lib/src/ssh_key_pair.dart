@@ -8,7 +8,6 @@ import 'package:dartssh2/dartssh2.dart';
 import 'package:dartssh2/src/hostkey/hostkey_ecdsa.dart';
 import 'package:dartssh2/src/hostkey/hostkey_ed25519.dart';
 import 'package:dartssh2/src/hostkey/hostkey_rsa.dart';
-import 'package:dartssh2/src/ssh_hostkey.dart';
 import 'package:dartssh2/src/ssh_message.dart';
 import 'package:dartssh2/src/utils/bigint.dart';
 import 'package:dartssh2/src/utils/bcrypt.dart';
@@ -66,6 +65,14 @@ abstract class SSHKeyPair {
   SSHSignature sign(Uint8List data);
 
   String toPem();
+}
+
+/// A key pair whose private key is held elsewhere, e.g. by an SSH agent, so
+/// signing is asynchronous. [SSHClient] offers it without a signature first
+/// and calls [signAsync] only after the server accepts the key
+/// (SSH_MSG_USERAUTH_PK_OK); when [signAsync] throws, the key is skipped.
+abstract class SSHAsyncKeyPair implements SSHKeyPair {
+  Future<SSHSignature> signAsync(Uint8List data);
 }
 
 class OpenSSHKeyPairs {

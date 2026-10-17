@@ -11,6 +11,7 @@ import 'package:dartssh2/src/ssh_channel.dart';
 import 'package:dartssh2/src/ssh_channel_id.dart';
 import 'package:dartssh2/src/ssh_errors.dart';
 import 'package:dartssh2/src/ssh_forward.dart';
+import 'package:dartssh2/src/ssh_hostkey.dart';
 import 'package:dartssh2/src/ssh_keepalive.dart';
 import 'package:dartssh2/src/ssh_key_pair.dart';
 import 'package:dartssh2/src/ssh_session.dart';
@@ -307,6 +308,9 @@ class SSHClient {
       : null;
 
   SSHAuthMethod? _currentAuthMethod;
+
+  /// The [SSHAsyncKeyPair] offered without a signature, waiting for PK_OK.
+  SSHAsyncKeyPair? _pendingKeyPair;
 
   var _transportReady = false;
 
@@ -886,6 +890,8 @@ class SSHClient {
         return _catch(() => _handleUserauthPasswordChangeRequest(payload));
       case SSHAuthMethod.keyboardInteractive:
         return _catch(() => _handleUserauthInfoRequest(payload));
+      case SSHAuthMethod.publicKey:
+        return _catch(_handleUserauthPkOk);
       default:
         printDebug?.call('unknown auth method: $_currentAuthMethod');
     }
@@ -1279,6 +1285,20 @@ class SSHClient {
 
     final keyPair = _keyPairsLeft.removeFirst();
 
+    // An agent key is signed with only once the server accepts it.
+    _pendingKeyPair = keyPair is SSHAsyncKeyPair ? keyPair : null;
+    if (keyPair is SSHAsyncKeyPair) {
+      _sendMessage(
+        SSH_Message_Userauth_Request.publicKey(
+          username: username,
+          publicKeyAlgorithm: keyPair.type,
+          publicKey: keyPair.toPublicKey().encode(),
+          signature: null,
+        ),
+      );
+      return;
+    }
+
     final challenge = _transport.composeChallenge(
       username: username,
       service: 'ssh-connection',
@@ -1293,6 +1313,41 @@ class SSHClient {
         publicKey: keyPair.toPublicKey().encode(),
         signature: keyPair.sign(challenge).encode(),
         // signature: null,
+      ),
+    );
+  }
+
+  /// The server accepts the offered [SSHAsyncKeyPair]: sign and send the
+  /// real request, or move on when signing fails (agent gone, user declined).
+  Future<void> _handleUserauthPkOk() async {
+    printDebug?.call('SSHClient._handleUserauthPkOk');
+    final keyPair = _pendingKeyPair;
+    _pendingKeyPair = null;
+    if (keyPair == null) return;
+
+    final publicKey = keyPair.toPublicKey().encode();
+    final challenge = _transport.composeChallenge(
+      username: username,
+      service: 'ssh-connection',
+      publicKeyAlgorithm: keyPair.type,
+      publicKey: publicKey,
+    );
+
+    final SSHSignature signature;
+    try {
+      signature = await keyPair.signAsync(challenge);
+    } catch (e) {
+      printDebug?.call('SSHClient._handleUserauthPkOk: $e');
+      return _tryNextAuthMethod();
+    }
+    if (_authenticated.isCompleted || isClosed) return;
+
+    _sendMessage(
+      SSH_Message_Userauth_Request.publicKey(
+        username: username,
+        publicKeyAlgorithm: keyPair.type,
+        publicKey: publicKey,
+        signature: signature.encode(),
       ),
     );
   }
