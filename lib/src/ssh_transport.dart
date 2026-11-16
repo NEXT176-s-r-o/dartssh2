@@ -19,6 +19,7 @@ import 'package:dartssh2/src/ssh_packet.dart';
 import 'package:dartssh2/src/utils/int.dart';
 import 'package:dartssh2/src/hostkey/hostkey_ed25519.dart';
 import 'package:dartssh2/src/utils/list.dart';
+import 'package:dartssh2/src/utils/zlib_stream.dart';
 import 'package:dartssh2/src/message/msg_kex.dart';
 import 'package:dartssh2/src/message/msg_kex_dh.dart';
 import 'package:dartssh2/src/message/msg_kex_ecdh.dart';
@@ -127,6 +128,13 @@ class SSHTransport {
   /// Subscription to the socket's [Stream]. It should be closed when the
   /// transport is closed.
   StreamSubscription? _socketSubscription;
+
+  /// Negotiated compression per direction, and the streams while it is on.
+  String? _clientCompression, _serverCompression;
+  SSHZlibStream? _deflater, _inflater;
+
+  /// The server accepted the user: `zlib@openssh.com` starts now.
+  bool _authenticated = false;
 
   /// Guards asynchronous packet processing to preserve message order.
   var _isProcessingData = false;
@@ -261,6 +269,10 @@ class SSHTransport {
       _rekeyPendingPackets.add(Uint8List.fromList(data));
       return;
     }
+
+    // Compressed before padding, MAC and encryption (RFC 4253 §6.2).
+    final deflater = _deflater;
+    if (deflater != null) data = deflater.convert(data);
 
     // Check if encryption is enabled and if we have MAC types initialized
     final clientMacType = _clientMacType;
@@ -581,10 +593,12 @@ class SSHTransport {
     printDebug?.call('SSHTransport._processPackets');
 
     while (_buffer.isNotEmpty && !isClosed) {
-      final payload = _consumePacket();
-      if (payload == null) {
+      final packet = _consumePacket();
+      if (packet == null) {
         break;
       }
+      final inflater = _inflater;
+      final payload = inflater == null ? packet : inflater.convert(packet);
 
       // if (payload.length > SSHPacket.maxPayloadLength) {
       //   throw SSHPacketError('Packet too long: ${payload.length}');
@@ -874,6 +888,18 @@ class SSHTransport {
     }
   }
 
+  /// (Re)start one direction's compression with its new keys, as OpenSSH does
+  /// at every NEWKEYS: `zlib` at once, `zlib@openssh.com` once authenticated.
+  void _startCompression({required bool outgoing}) {
+    final name = outgoing == isClient ? _clientCompression : _serverCompression;
+    final on = name == 'zlib' || (name == 'zlib@openssh.com' && _authenticated);
+    if (outgoing) {
+      _deflater = on ? SSHZlibStream.deflate() : null;
+    } else {
+      _inflater = on ? SSHZlibStream.inflate() : null;
+    }
+  }
+
   /// Derives and applies the encryption and MAC keys for local-to-remote communication.
   void _applyLocalKeys() {
     final cipherType = isClient ? _clientCipherType : _serverCipherType;
@@ -1032,8 +1058,8 @@ class SSHTransport {
       encryptionServerToClient: algorithms.cipher.toNameList(),
       macClientToServer: algorithms.mac.toNameList(),
       macServerToClient: algorithms.mac.toNameList(),
-      compressionClientToServer: ['none'],
-      compressionServerToClient: ['none'],
+      compressionClientToServer: isServer ? ['none'] : algorithms.compression,
+      compressionServerToClient: isServer ? ['none'] : algorithms.compression,
       firstKexPacketFollows: false,
     );
 
@@ -1112,6 +1138,14 @@ class SSHTransport {
         return _handleMessageKexReply(message);
       case SSH_Message_NewKeys.messageId:
         return _handleMessageNewKeys(message);
+      case SSH_Message_Userauth_Success.messageId when isClient:
+        // Delayed compression starts with the next packet either way.
+        if (!_authenticated) {
+          _authenticated = true;
+          if (_deflater == null) _startCompression(outgoing: true);
+          if (_inflater == null) _startCompression(outgoing: false);
+        }
+        onPacket?.call(message);
       default:
         onPacket?.call(message);
     }
@@ -1167,6 +1201,23 @@ class SSHTransport {
       remoteAlgorithms: message.macServerToClient,
       isServer: isServer,
     );
+
+    String? compression(List<String> remote) {
+      final local = isServer ? const ['none'] : algorithms.compression;
+      final (client, server) = isServer ? (remote, local) : (local, remote);
+      for (final name in client) {
+        if (server.contains(name)) return name;
+      }
+      return null;
+    }
+
+    _clientCompression = compression(message.compressionClientToServer);
+    _serverCompression = compression(message.compressionServerToClient);
+    if (_clientCompression == null || _serverCompression == null) {
+      throw StateError('No matching compression algorithm');
+    }
+    printDebug?.call('SSHTransport compression: $_clientCompression / '
+        '$_serverCompression');
 
     if (_kexType == null) {
       throw StateError('No matching key exchange algorithm');
@@ -1315,6 +1366,7 @@ class SSHTransport {
     if (_hostkeyVerified) {
       _sendNewKeys();
       _applyLocalKeys();
+      _startCompression(outgoing: true);
       return;
     }
 
@@ -1330,6 +1382,7 @@ class SSHTransport {
     _hostkeyVerified = true;
     _sendNewKeys();
     _applyLocalKeys();
+    _startCompression(outgoing: true);
     onReady?.call();
   }
 
@@ -1352,6 +1405,7 @@ class SSHTransport {
     printTrace?.call('<- $socket: SSH_Message_NewKeys');
 
     _applyRemoteKeys();
+    _startCompression(outgoing: false);
 
     // Key exchange round finished.
     _kexInProgress = false;

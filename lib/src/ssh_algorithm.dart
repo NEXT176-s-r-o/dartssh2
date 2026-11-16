@@ -43,6 +43,11 @@ class SSHAlgorithms {
   /// Algorithm used for the authentication.
   final List<SSHMacType> mac;
 
+  /// Compression, by name in order of preference: `none`, `zlib` or
+  /// `zlib@openssh.com` (from authentication on, OpenSSH's default). Only a
+  /// client offers more than `none`.
+  final List<String> compression;
+
   const SSHAlgorithms({
     this.kex = const [
       SSHKexType.x25519,
@@ -81,5 +86,6 @@ class SSHAlgorithms {
       SSHMacType.hmacSha512,
       SSHMacType.hmacMd5,
     ],
+    this.compression = const ['none'],
   });
 }
